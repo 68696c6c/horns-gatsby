@@ -1,0 +1,23 @@
+version: "3"
+
+networks:
+  default:
+    external:
+      name: docker-dev
+
+services:
+
+  app:
+    image: gatsby-horns:dev
+    command: yarn develop:docker
+    volumes:
+    - ./:/site
+    working_dir: /site
+    ports:
+    - "80"
+    environment:
+      VIRTUAL_HOST: horns.local
+    networks:
+      default:
+        aliases:
+        - horns.local
