@@ -1,0 +1,31 @@
+{
+  "StackName": "horns-pipeline-production",
+  "DisableRollback": false,
+  "Parameters": {
+    "EnvironmentName": "development",
+    "AppStackName": "horns-development",
+    "AppRepositoryARN": "",
+    "SiteDistributionID": "",
+    "RepositoryURL": "",
+    "ToolsRepositoryARN": ""
+  },
+  "Tags": {
+    "name": "horns-pipeline-development",
+    "environment": "development",
+    "team": "Technology",
+    "project": "Infrastructure",
+    "application": "Horns.xyz",
+    "drt": "68696c6c@gmail.com",
+    "ttl": "-1"
+  },
+  "StackPolicy": {
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "NotAction": "Update:Delete",
+        "Principal": "*",
+        "Resource": "*"
+      }
+    ]
+  }
+}

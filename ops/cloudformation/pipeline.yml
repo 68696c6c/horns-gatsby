@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deployment pipeline for the Kedge Webapp.
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: production
+
+  AppStackName:
+    Description: Name of the stack containing the application to deploy.
+    Type: String
+    Default: kedge-web
+
+  AppRepositoryARN:
+    Description: ARN of the ECR repository for the application to deploy.
+    Type: String
+
+  SiteDistributionID:
+    Description: Distribution ID for the application to deploy.
+    Type: String
+
+  RepositoryURL:
+    Description: The URL of the repository containing the image to use to build the site.
+    Type: String
+
+  ToolsRepositoryARN:
+    Description: ARN of the ECR repository containing the image to use during the bitbucket pipeline step.
+    Type: String
+
+Resources:
+
+  ##### Build Pipeline #####
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  BitbucketPipelineUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-bb-user"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub "${SourceBucket.Arn}/*"
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+              - Resource: !Ref ToolsRepositoryARN
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+
+                # If we import the ARN from the app stack's outputs like we do for the tools repo above, AWS will not
+                # allow the app stack to be deleted while this stack is up.  Since this stack contains the Role needed
+                # to delete the app stack, this situation makes it impossible to delete either stack.  Importing values
+                # from the Ops stack and Cluster is fine because those stacks do not depend on this one and they should
+                # never be deleted before their dependant app stacks.
+              - Resource: !Ref AppRepositoryARN
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+
+  ##### Deployment Pipeline #####
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Principal:
+              Service: codepipeline.amazonaws.com
+            Effect: Allow
+            Action: sts:AssumeRole
+          - Principal:
+              Service: cloudformation.amazonaws.com
+            Effect: Allow
+            Action: sts:AssumeRole
+          - Principal:
+              Service: codebuild.amazonaws.com
+            Effect: Allow
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - '*'
+
+  PipelineSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-pipeline
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref SourceBucket
+                S3ObjectKey: !Sub ${AppStackName}/ops.zip
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: UpdateStack
+          Actions:
+            - Name: CreateAppChangeset
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: App
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt PipelineRole.Arn
+                StackName: !Ref AppStackName
+                ChangeSetName: !Sub ${AppStackName}-updated
+                TemplateConfiguration: App::app.json
+                TemplatePath: 'App::ops/cloudformation/app.yml'
+                Capabilities: CAPABILITY_NAMED_IAM
+              RunOrder: 1
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref PipelineSNSTopic
+                CustomData: !Sub >-
+                  A new change set was created for the ${AppStackName} stack. Do you
+                  want to implement the changes?
+              RunOrder: 2
+            - Name: ExecuteAppChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Sub ${AppStackName}-updated
+                RoleArn: !GetAtt PipelineRole.Arn
+                StackName: !Ref AppStackName
+              RunOrder: 3
+            - Name: CreateInvalidation
+              InputArtifacts:
+                - Name: App
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CreateInvalidationCodeBuild
+              RunOrder: 4
+
+  # Upload the built site to the site bucket and create a Cloudfront invalidation.
+  CreateInvalidationCodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub "${AppStackName}-create-invalidation"
+      ServiceRole:
+        Fn::GetAtt: PipelineRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - yarn
+                - echo $ENVIRONMENT_NAME
+                - LOCATION=$ENVIRONMENT_NAME yarn build || ls -la public
+                - aws s3 sync public "s3://${SITE_BUCKET}"
+                - aws cloudfront create-invalidation --distribution-id "${SITE_DISTRIBUTION_ID}" --paths /index.html /*
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref RepositoryURL
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: SITE_BUCKET
+            Value: !Ref AppStackName
+          - Name: SITE_DISTRIBUTION_ID
+            Value: !Ref SiteDistributionID
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+
+Outputs:
+
+  SourceBucketArn:
+    Value: !GetAtt SourceBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceBucketArn"
+
+  SourceBucketName:
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceBucketName"
+
+  BitbucketUser:
+    Value: !Ref BitbucketPipelineUser
+    Export:
+      Name: !Sub "${AWS::StackName}-BitbucketPipelineUser"
+
+  ArtifactBucketArn:
+    Value: !GetAtt ArtifactBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucketArn"
+
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucketName"
+
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineUrl"

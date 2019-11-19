@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infrastructure for the Kedge Webapp.
+
+Parameters:
+
+  DomainName:
+    Type: String
+
+  CfAliases:
+    Type: String
+    Description: List of pipe-delimited domain aliases for the Cloudfront distribution
+    Default: ":none:"
+
+  CertificateARN:
+    Type: String
+    Description: ARN of certificate to use for the Cloudfront distribution
+
+Conditions:
+  HasAliases:
+    Fn::Not:
+      - !Equals [!Ref CfAliases, ":none:"]
+
+Resources:
+
+  # This repository stores the image used by CodeBuild to generate the static site.
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub ${AWS::StackName}
+      RepositoryPolicyText:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowPull
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}
+      AccessControl: BucketOwnerFullControl
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["GET"]
+            AllowedOrigins: ["*"]
+            Id: "OpenCors"
+            MaxAge: 3600
+      WebsiteConfiguration:
+        IndexDocument: index.html
+    Metadata:
+      Comment: !Sub 'S3 Bucket for ${DomainName}'
+    DeletionPolicy: Delete
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: !Sub ${DomainName}-SiteBucketPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SiteBucket
+                - /*
+      Bucket: !Ref SiteBucket
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName:
+              Fn::Select:
+                - 2
+                - Fn::Split:
+                    - /
+                    - !GetAtt SiteBucket.WebsiteURL
+            Id: !Sub ${DomainName}-OriginId
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+        Enabled: true
+        Comment: !Sub 'CloudFront Distribution for ${DomainName}'
+        DefaultRootObject: index.html
+        Logging:
+          IncludeCookies: false
+          Bucket: !Sub "${SiteBucket}.s3.amazonaws.com"
+          Prefix: !Sub ${DomainName}
+        Aliases: !If
+          - HasAliases
+          - !Split
+            - "|"
+            - !Ref CfAliases
+          - !Ref AWS::NoValue
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          TargetOriginId: !Sub ${DomainName}-OriginId
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+#          TrustedSigners:
+#          - 1234567890EX
+#          - 1234567891EX
+          ViewerProtocolPolicy: allow-all
+#        ViewerCertificate:
+#          CloudFrontDefaultCertificate: true
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateARN
+          SslSupportMethod: sni-only
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+
+Outputs:
+
+  AppName:
+    Value: !Sub ${AWS::StackName}
+    Export:
+      Name: !Sub "${AWS::StackName}-AppName"
+
+  RepositoryUrl:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryUrl"
+
+  RepositoryARN:
+    Value: !GetAtt Repository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryARN"
+
+  SiteBucketName:
+    Value: !Ref SiteBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SiteBucketName"
+
+  SiteDistributionID:
+    Value: !Ref SiteDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-SiteDistributionID"
